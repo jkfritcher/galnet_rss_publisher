@@ -1,0 +1,72 @@
+name: Deploy Lambda
+
+on:
+  - push
+  - workflow_dispatch
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PYTHON_PLATFORM: manylinux2014_aarch64
+  PYTHON_VERSION: '3.13'
+  ARCHIVE_NAME: galnet_rss_publisher.zip
+  TARGET_DIR: target
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build artifact
+        run: |
+          # Create target directory
+          mkdir target
+
+          # Install dependencies
+          echo "Installing Python dependencies..."
+          pip install \
+            --platform ${{ env.PYTHON_PLATFORM }} \
+            --python-version ${{ env.PYTHON_VERSION }} \
+            --implementation cp \
+            --only-binary=:all: \
+            --upgrade \
+            -t ${{ env.TARGET_DIR }} \
+            -r requirements.txt
+
+          # Copy our code into target dir
+          cp *.py ${{ env.TARGET_DIR }}
+
+          # Cleanup target directory to reduce archive size
+          echo "Cleaning up target directory..."
+          find ${{ env.TARGET_DIR }} -name "*.pyc" -delete
+          find ${{ env.TARGET_DIR }} -name "__pycache__" -type d -exec rm -rf {} +
+          find ${{ env.TARGET_DIR }} -name "*.dist-info" -type d -exec rm -rf {} +
+          find ${{ env.TARGET_DIR }} -name "tests" -type d -exec rm -rf {} +
+          find ${{ env.TARGET_DIR }} -name "test_*" -delete
+          find ${{ env.TARGET_DIR }} -name "examples" -type d -exec rm -rf {} +
+
+          echo "Done building archive."
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: ${{ github.run_id }}
+          role-duration-seconds: 900
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy Lambda function
+        uses: aws-actions/aws-lambda-deploy@v1.1.0
+        with:
+          function-name: galnet_rss_publisher
+          package-type: Zip
+          code-artifacts-dir: ${{ env.TARGET_DIR }}
+          memory-size: 128
+          timeout: 30
+          handler: galnet_rss_publisher.lambda_handler
+          runtime: python${{ env.PYTHON_VERSION }}
