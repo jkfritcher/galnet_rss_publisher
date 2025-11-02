@@ -13,6 +13,7 @@ import boto3.session
 import atoma, atoma.rss
 import bleach
 import requests
+from requests import ConnectionError, HTTPError, Timeout
 
 # Environment Variables
 #
@@ -52,7 +53,7 @@ br_pat = re.compile('<br ?/>')
 
 s3_bucket = os.environ.get('S3_BUCKET_NAME')
 s3_key = os.environ.get('S3_KEY_NAME')
-rss_url = os.environ['RSS_URL']
+rss_url = os.environ.get('RSS_URL', '')
 
 log_levels = {
     'debug':    logging.DEBUG,
@@ -65,7 +66,7 @@ def set_logger_level(level: str|None):
     if level:
         level_num = log_levels.get(level.lower())
         if level_num:
-            # Set level at root log
+            # Set level on the named logger
             logger.setLevel(level_num)
         else:
             logger.warning(f"Invalid logging level specified, ignorning. '{level}'")
@@ -105,8 +106,6 @@ def filter_item(title: str, body: str) -> bool:
 
 def get_webhook_url() -> str:
     webhook_url = os.environ['WEBHOOK_URL']
-    if not webhook_url:
-        raise ValueError("WEBHOOK_URL is not defined!")
     if not webhook_url.startswith('arn') and not webhook_url.startswith('http'):
         logger.error(f"Invalid webhook URL provided, '{webhook_url}'")
         raise ValueError("WEBHOOK_URL must be an arn or http/s URL")
@@ -135,8 +134,8 @@ def load_state() -> dict[str, Any]:
             state_str = res['Body'].read().decode('utf-8')
         except ClientError as ex:
             if ex.response['Error']['Code'] != 'NoSuchKey':
-                logger.error(f"S3 error occurred: {ex}")
-                raise ex
+                logger.exception("S3 error occurred")
+                raise
             logger.info("No previous state found, starting fresh")
             state_str = '{}'
     else:
@@ -147,7 +146,11 @@ def load_state() -> dict[str, Any]:
             logger.info("No previous state found, starting fresh")
             state_str = '{}'
 
-    state = json.loads(state_str)
+    try:
+        state = json.loads(state_str)
+    except json.JSONDecodeError:
+        logger.exception("Failed to decode state, starting fresh")
+        state = {}
     logger.info("Last saved state loaded")
     logger.debug(f"Last Saved State - {state}")
     return state
@@ -170,7 +173,7 @@ def fetch_rss_feed(url: str) -> atoma.rss.RSSChannel|None:
         logger.info("RSS feed fetched and parsed successfully")
         return feed
     except requests.RequestException as ex:
-        logger.error(f"Failed to fetch RSS feed: {ex}")
+        logger.exception("Failed to fetch RSS feed")
         return None
 
 def process_feed_items(items: list[Any], articles_seen: list[str]) -> list[tuple[str, str]]:
@@ -208,12 +211,18 @@ def publish_articles(webhook_url: str, articles_to_publish: list[tuple[str, str]
         parts = paginate_message(content)
         for part in parts:
             content = { 'content': part }
-            res = requests.post(webhook_url, json=content, timeout=REQUEST_TIMEOUT)
-            logger.debug(f"{res} - {res.content}")
+            try:
+                res = requests.post(webhook_url, json=content, timeout=REQUEST_TIMEOUT)
+                res.raise_for_status()
+            except:
+                logger.exception("Error while posting article to webhook")
+                return published_count
             time.sleep(1)
-        articles_seen.append(guid)
-        published_count += 1
-        logger.info(f"Successfully published {guid}")
+        else:
+            articles_seen.append(guid)
+            published_count += 1
+            logger.info(f"Successfully published {guid}")
+        time.sleep(1)
     return published_count
 
 def prune_articles_seen(articles_seen: list[str], state: dict[str, Any]):
@@ -228,6 +237,16 @@ def lambda_handler(event: dict[str, Any]|None, context:Any|None):
     set_logger_level(os.environ.get('LOGGING_LEVEL'))
 
     logger.debug(f"event = {json.dumps(event)}")
+
+    # Validate environment variables
+    if not rss_url:
+        raise ValueError("RSS_URL required")
+    if not os.environ.get('WEBHOOK_URL'):
+        raise ValueError("WEBHOOK_URL required")
+    if not local_state:
+        # S3 bucket/key is required for remote state
+        if not s3_bucket or not s3_key:
+            raise ValueError("S3_BUCKET_NAME and S3_KEY_NAME is required")
 
     # Load previous state
     state = load_state()
