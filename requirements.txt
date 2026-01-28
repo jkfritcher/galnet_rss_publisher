@@ -1,5 +1,6 @@
-atoma
-bleach
-requests
-boto3
-botocore
+atoma >= 0.0.17
+bleach >= 6.3.0
+requests >= 2.32.5
+boto3 >= 1.42.36
+botocore >= 1.42.36
+urllib3 >= 2.6.3
